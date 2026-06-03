@@ -12,6 +12,15 @@ from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Optional
 
+# 自动加载项目根目录的 .env 文件 (静默降级)
+try:
+    from dotenv import load_dotenv, find_dotenv
+    _env_path = find_dotenv(usecwd=True)
+    if _env_path:
+        load_dotenv(_env_path)
+except ImportError:
+    pass  # python-dotenv 未安装时使用系统环境变量
+
 from loguru import logger
 
 # Azure SDK imports — 需要安装: pip install azure-ai-documentintelligence

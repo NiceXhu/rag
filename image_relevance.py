@@ -16,8 +16,9 @@
 过滤后的图片仍保留在输出中, 但不调用 Dify 生成描述。
 """
 import hashlib
+import os
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -37,7 +38,7 @@ EDGE_MARGIN_RATIO = 0.08           # 8% 以内
 
 # 宽高比: 超出此范围的视为装饰分割线
 MIN_ASPECT_RATIO = 0.15            # 高/宽
-MAX_ASPECT_RATIO = 6.0             # 高/宽
+MAX_ASPECT_RATIO = 12.0            # 高/宽 (放宽以允许细长箭头/标注)
 
 # 跨页重复: 相同签名出现 ≥ 此次数视为模板元素
 TEMPLATE_REPETITION_THRESHOLD = 2  # 出现 ≥ 2 页
@@ -53,6 +54,16 @@ TEXT_OVERLAP_COUNT = 3             # ≥ 3 个文本块重叠
 
 # 内容孤立: 周围文本的引用关键词数量 < 此数 → 内容孤立
 MIN_CONTEXT_REFERENCES = 1
+
+# ── 截图检测阈值 ────────────────────────────────────────
+# 截图特征: 覆盖率高 + 文字重叠多 = 可能是 UI 截图而非背景
+SCREENSHOT_MIN_COVERAGE = 0.35     # 占页面 ≥ 35%
+SCREENSHOT_MIN_OVERLAP = 4         # 重叠文字块 ≥ 4 段
+SCREENSHOT_MIN_AREA = 2.0          # 最小面积 (inch²) — 排除小图标
+
+# ── PPT 模式 (RAG_PPT_MODE=true 时启用) ────────────────
+PPT_MODE_OVERLAP_THRESHOLD = 10    # R6 阈值提高到 10
+PPT_MODE_MIN_AREA = 0.2            # 更低的装饰面积阈值
 
 
 # ══════════════════════════════════════════════════════════
@@ -239,7 +250,6 @@ def load_custom_detectors_from_config() -> list[ArtifactDetector]:
         logger.debug(f"从 config 加载自定义检测器失败 (可忽略): {e}")
 
     # ── 方式2: 环境变量快速添加 ──
-    import os
     env_keywords = os.getenv("MINERU_ARTIFACT_KEYWORDS", "")
     env_patterns = os.getenv("MINERU_ARTIFACT_PATTERNS", "")
 
@@ -350,18 +360,25 @@ def _compute_signature(figure: dict) -> str:
     """
     计算图片签名 (用于跨页重复检测)。
 
-    基于尺寸 + 宽高比的组合, 不依赖图片内容 (避免 base64 解码开销)。
-    同模板的元素在不同页面上尺寸和比例通常一致。
+    基于尺寸 + 宽高比 + 面积覆盖率，多维度降低签名碰撞。
+    培训 PPT 中所有截图尺寸相同但宽高比和覆盖率可能不同。
     """
     bbox = figure.get("bbox") or [0, 0, 0, 0]
     w = max(bbox[2] - bbox[0], 0)
     h = max(bbox[3] - bbox[1], 0)
 
-    # 量化到 0.1 inch 精度, 允许微小偏差
+    if w == 0 or h == 0:
+        return "empty"
+
+    # 量化到 0.1 inch 精度
     w_bucket = round(w * 10) / 10
     h_bucket = round(h * 10) / 10
+    # 宽高比 bucket (0.1 精度)
+    aspect = round(h / w, 1)
+    # 面积 bucket (0.5 sq inch 精度)
+    area_bucket = round((w * h) / 0.5) * 0.5
 
-    sig = f"{w_bucket:.1f}x{h_bucket:.1f}"
+    sig = f"{w_bucket:.1f}x{h_bucket:.1f}_a{aspect:.1f}_s{area_bucket:.1f}"
     return hashlib.md5(sig.encode()).hexdigest()[:8]
 
 
@@ -407,6 +424,37 @@ def _calc_page_coverage(
     area = _calc_area(figure_bbox)
     page_area = page_width * page_height
     return area / page_area if page_area > 0 else 0.0
+
+
+def _is_likely_screenshot(
+    area: float,
+    page_width: float,
+    page_height: float,
+    overlap_count: int,
+    overlap_avg_len: float,
+) -> bool:
+    """
+    检测图片是否可能是 UI 截图而非背景。
+
+    截图特征:
+    1. 覆盖率高 — 通常占据大部分 slide 面积
+    2. 文字重叠多 — OCR 识别出大量 UI 文本
+    3. 重叠文字短 — UI 标签/按钮文字而非正文段落
+    4. 面积 ≥ 下限 — 排除小图标
+    """
+    if area < SCREENSHOT_MIN_AREA:
+        return False
+    if page_width <= 0 or page_height <= 0:
+        return False
+    coverage = area / (page_width * page_height)
+    if coverage < SCREENSHOT_MIN_COVERAGE:
+        return False
+    if overlap_count < SCREENSHOT_MIN_OVERLAP:
+        return False
+    # 截图文字是短标签 (< 80 chars avg)，背景图文字是完整段落
+    if overlap_avg_len > 80:
+        return False
+    return True
 
 
 def _extract_figure_overlap_text(
@@ -489,13 +537,18 @@ def _count_context_references(
     if caption and len(caption.strip()) >= MIN_CONTEXT_LENGTH:
         ref_count += 1
 
-    # 上下文引用词
+    # 上下文引用词 (学术通用 + 培训PPT)
     ref_keywords = [
         r'如图', r'见图', r'如图所示', r'如下图', r'上图', r'下图',
         r'figure\s*\d', r'fig\.\s*\d', r'as shown', r'see figure',
         r'following (image|figure|chart|diagram|picture)',
         r'below', r'above',
         r'所示', r'参见图',
+        # 培训 PPT 场景
+        r'示例', r'示意', r'示意图', r'如下所示', r'参考下图',
+        r'界面', r'窗口', r'对话框', r'菜单', r'按钮',
+        r'screenshot', r'example', r'sample', r'demo',
+        r'click', r'select', r'操作', r'步骤', r'配置',
     ]
 
     ctx_lower = context_text.lower()
@@ -539,11 +592,15 @@ def _has_context(
     # 周围文本检查
     if len(context_text.strip()) >= MIN_CONTEXT_LENGTH:
         context_lower = context_text.lower()
-        # 多语言引用词
+        # 多语言引用词 (学术 + 培训 PPT)
         ref_keywords = [
             "图", "如图", "见下图", "下表", "figure", "fig.", "shown",
             "illustrated", "depicted", "image", "chart", "diagram",
             "照片", "图示", "参见",
+            # 培训 PPT 场景
+            "示例", "示意", "示意", "如下", "截图", "界面", "窗口",
+            "对话框", "菜单", "按钮", "操作", "步骤", "配置",
+            "screenshot", "example", "sample", "demo", "click", "select",
         ]
         for kw in ref_keywords:
             if kw in context_lower:
@@ -595,6 +652,15 @@ def assess_image_relevance(
         signature=sig,
     )
 
+    # ── PPT 模式检测 ──
+    ppt_mode = os.getenv("RAG_PPT_MODE", "").lower() in ("true", "1", "yes")
+    _overlap_threshold = PPT_MODE_OVERLAP_THRESHOLD if ppt_mode else TEXT_OVERLAP_COUNT
+    _min_area = PPT_MODE_MIN_AREA if ppt_mode else MIN_MEANINGFUL_AREA
+
+    if ppt_mode:
+        logger.debug(f"图片过滤: PPT 模式已启用 "
+                     f"(overlap_threshold={_overlap_threshold}, min_area={_min_area})")
+
     # ── 规则 1: 绝对尺寸过滤 ──
     if area < ABSOLUTE_MIN_AREA:
         assessment.should_skip = True
@@ -602,17 +668,38 @@ def assess_image_relevance(
         return assessment
 
     # ── 规则 2: 尺寸 + 边缘位置 → 角标/图标 ──
-    if area < MIN_MEANINGFUL_AREA:
+    # PPT 模式下: 有上下文引用的小边缘元素放行 (可能是内容的标注箭头)
+    if area < _min_area:
         is_edge = _is_edge_position(bbox, page_width, page_height)
         assessment.is_edge_position = is_edge
 
         if is_edge:
-            assessment.should_skip = True
-            assessment.skip_reason = f"small_edge_element (area={area:.2f}, edge_pos)"
-            return assessment
+            # PPT 模式: 有 caption/引用则放行
+            if ppt_mode and (
+                (figure.get("caption") or "").strip()
+                or _has_context(figure, page_paragraphs or [], context_text)
+            ):
+                pass  # 放行
+            else:
+                assessment.should_skip = True
+                assessment.skip_reason = f"small_edge_element (area={area:.2f}, edge_pos)"
+                return assessment
+
+    # ── 预计算: 截图检测 (用于 R3/R6 保护) ──
+    overlap_count = _count_overlapping_paragraphs(bbox, page_paragraphs or [])
+    overlap_text = _extract_figure_overlap_text(bbox, page_paragraphs or [])
+    overlap_words = overlap_text.split() if overlap_text else []
+    overlap_avg_len = sum(len(w) for w in overlap_words) / max(len(overlap_words), 1) * 5
+
+    is_screenshot = _is_likely_screenshot(
+        area, page_width, page_height, overlap_count, overlap_avg_len,
+    )
+    if is_screenshot:
+        assessment.text_overlap_count = overlap_count
 
     # ── 规则 3: 模板元素重复 ──
-    if template_signatures and sig in template_signatures:
+    # ★ 截图保护: 操作步骤截图内容不同但尺寸相同, 不是模板
+    if template_signatures and sig in template_signatures and not is_screenshot:
         assessment.is_repeated_template = True
         assessment.should_skip = True
         assessment.skip_reason = f"template_repetition (sig={sig})"
@@ -628,30 +715,28 @@ def assess_image_relevance(
     has_ctx = _has_context(figure, page_paragraphs or [], context_text)
     assessment.has_context = has_ctx
 
-    # 小图片 + 无上下文 → 可能是装饰
-    if area < MIN_MEANINGFUL_AREA * 3 and not has_ctx:
+    if area < _min_area * 3 and not has_ctx:
         assessment.should_skip = True
         assessment.skip_reason = f"small_no_context (area={area:.2f}, no ref)"
         return assessment
 
     # ── 规则 6: 文本重叠 (背景检测) ──
-    #  背景图上会渲染大量文本段落, 正常的图文分离区域不会有大量重叠
-    overlap_count = _count_overlapping_paragraphs(bbox, page_paragraphs or [])
-    assessment.text_overlap_count = overlap_count
-
-    if overlap_count >= TEXT_OVERLAP_COUNT:
-        assessment.should_skip = True
-        assessment.skip_reason = (
-            f"text_overlap_bg ({overlap_count} paragraphs overlap → likely background)"
-        )
-        return assessment
+    # ★ 截图保护: 截图 OCR 文字天然重叠, 不是背景信号
+    if not is_screenshot:
+        assessment.text_overlap_count = overlap_count
+        if overlap_count >= _overlap_threshold:
+            assessment.should_skip = True
+            assessment.skip_reason = (
+                f"text_overlap_bg ({overlap_count} paragraphs overlap → likely background)"
+            )
+            return assessment
 
     # ── 规则 7: 高页面覆盖率 ──
-    #  单图覆盖 > 65% 页面 + 无明确上下文引用 → 背景
     coverage = _calc_page_coverage(bbox, page_width, page_height)
     assessment.coverage_ratio = coverage
 
-    if coverage > BACKGROUND_COVERAGE_RATIO and not has_ctx:
+    # ★ 截图保护: 截图覆盖率天然高, 用 R8 来判定而非 R7
+    if not is_screenshot and coverage > BACKGROUND_COVERAGE_RATIO and not has_ctx:
         assessment.should_skip = True
         assessment.skip_reason = (
             f"high_coverage_bg (covers {coverage:.0%} of page, no context ref)"
@@ -659,15 +744,19 @@ def assess_image_relevance(
         return assessment
 
     # ── 规则 8: 嵌入物内容检测 ──
-    #  检测图片区域 OCR 文本中的邮件/聊天/水印等无关内容模式
     is_artifact, artifact_matches = _detect_artifact_content(
         bbox, page_paragraphs or [],
     )
     assessment.artifact_matches = artifact_matches
 
     if is_artifact:
+        # 截图 + 无关内容模式 → 确实是无价值截屏 (邮件/聊天记录)
+        # 截图 + 无无关模式 → 是有价值内容 (操作界面/图表)
+        if is_screenshot:
+            logger.debug(
+                f"  截图 {key}: 检测到嵌入物模式 {artifact_matches} → 过滤"
+            )
         assessment.should_skip = True
-        # 查找触发检测器的可读标签
         triggered_labels = []
         for det in ARTIFACT_DETECTORS:
             if det.category in artifact_matches:
@@ -678,20 +767,25 @@ def assess_image_relevance(
         return assessment
 
     # ── 规则 9: 内容孤立检测 ──
-    #  图片既无 caption 引用, 也无周围文本引用 → 可能是无关嵌入
     ref_count = _count_context_references(
         figure, context_text, page_paragraphs or [], bbox,
     )
     assessment.context_ref_count = ref_count
 
     if ref_count < MIN_CONTEXT_REFERENCES:
-        # 仅对中等尺寸图片触发 (小图已被 Rule 2/5 覆盖, 大背景已被 Rule 6/7 覆盖)
-        if MIN_MEANINGFUL_AREA * 2 < area < MIN_MEANINGFUL_AREA * 20:
+        if _min_area * 2 < area < _min_area * 20:
             assessment.should_skip = True
             assessment.skip_reason = (
                 f"contextually_isolated (area={area:.1f}sq\", 0 refs → likely embedded artifact)"
             )
             return assessment
+
+    # ── 截图通过过滤 — 记录日志 ──
+    if is_screenshot:
+        logger.debug(
+            f"  截图 {key} 通过过滤: area={area:.1f}sq\", "
+            f"coverage={coverage:.0%}, overlap={overlap_count}"
+        )
 
     return assessment
 
@@ -813,5 +907,3 @@ def apply_image_filter(pages_data: list[dict]) -> FilterResult:
     return filter_images_for_enhancement(figures_by_page, pages_data)
 
 
-# 需要 defaultdict
-from collections import defaultdict

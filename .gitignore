@@ -1,0 +1,55 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# ── Virtual environments ──
+.venv/
+venv/
+ENV/
+env/
+
+# ── IDE / Editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Environment & Secrets ──
+.env
+.env.*
+*.local
+
+# ── Logs ──
+*.log
+logs/
+
+# ── Run outputs ──
+output/
+outputs/
+tmp/
+temp/
+
+# ── OS files ──
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── Jupyter ──
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Data (optional — uncomment if large test data not tracked) ──
+# data/
+# test_data/
+
+# ── MinerU related ──
+*.pdf.tmp/

@@ -1,0 +1,34 @@
+# ── Azure AI Document Intelligence (可选) ──
+azure-ai-documentintelligence>=1.0.0
+azure-core>=1.30.0
+
+# ── Alibaba Cloud Document Mind 文档解析大模型版 (可选, 替换 Azure DI) ──
+# 基于大模型的文档结构化解析，原生支持 PDF/Word/PPT/Excel/图片/Markdown/HTML
+# 返回 Markdown + 结构化元素 (段落/表格/图片/标题层级)
+# 环境变量: ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET
+alibabacloud_docmind_api20220711>=1.2.1
+alibabacloud_tea_openapi>=0.3.0
+
+# ── Environment / Config ──
+python-dotenv>=1.0.0
+
+# ── HTTP Client ──
+httpx>=0.27.0
+
+# ── PDF Processing ──
+pypdfium2>=4.30.0
+
+# ── Image Processing ──
+Pillow>=10.0.0
+
+# ── Logging ──
+loguru>=0.7.0
+
+# ── Progress Bar ──
+tqdm>=4.66.0
+
+# ── MinerU (core framework — install separately or from source) ──
+# This project is a backend module of the MinerU ecosystem and imports
+# heavily from the `mineru` package. Install mineru first via:
+#   pip install magic-pdf   (or from your organization's internal registry)
+# mineru / magic-pdf

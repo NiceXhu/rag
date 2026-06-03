@@ -19,10 +19,10 @@ from loguru import logger
 
 
 # ── 配置 ──────────────────────────────────────────────────
-# 表头相似度阈值: 续页表头与首页表头内容的 fuzzy 匹配阈值
+# 表头相似度阈值: 续页表头与首页表头内容的 Jaccard 匹配阈值
 HEADER_SIMILARITY_THRESHOLD = 0.7
-# 续页表格起始位置阈值: 表格顶部 y 坐标 < 此值 (inch) 视为页面顶部表格
-CONTINUATION_Y_THRESHOLD = 1.5  # inches from page top
+# 数据行签名相似度阈值: 两表数据行列模式匹配的最低要求
+DATA_SIMILARITY_THRESHOLD = 0.5
 
 
 def _get_cell_text(cell: dict) -> str:
@@ -55,15 +55,17 @@ def _detect_header_rows(cells: list[dict]) -> set[int]:
     """
     检测表格中的表头行。
 
-    仅信任 Azure DI 的 cell.kind == "columnHeader" 显式标注。
-    不做回退猜测 — 避免将续页无表头表格的第一行数据误判为表头。
+    基于 Azure DI 的 cell.kind == "columnHeader" 显式标注，
+    但会验证标注行是否确实符合表头特征 (而非被误标的数据行)。
     """
-    header_rows = set()
+    candidates = set()
     for cell in cells:
         if _is_header_cell(cell):
-            header_rows.add(_row_index(cell))
-    # 不设回退: 续页表格通常没有 kind 标注, 返回空 set 是正确的
-    return header_rows
+            candidates.add(_row_index(cell))
+    if not candidates:
+        return set()
+    # 过滤被 OCR 误标为 columnHeader 的数据行
+    return _validate_header_candidates(cells, candidates)
 
 
 def _get_header_rows_or_none(cells: list[dict]) -> Optional[set[int]]:
@@ -71,16 +73,126 @@ def _get_header_rows_or_none(cells: list[dict]) -> Optional[set[int]]:
     获取表头行, 如果没有显式标注则返回 None。
 
     与 _detect_header_rows 的区别:
-    - 有显式标注 → 返回表头行集合
-    - 没有显式标注 → 返回 None (表示「不确定」, 而非「没有」)
+    - 有经过验证的显式标注 → 返回表头行集合
+    - 没有显式标注 (或全被过滤) → 返回 None
 
     用于合并时区分「确定没有表头」和「不知道有没有表头」。
     """
-    header_rows = set()
+    candidates = set()
     for cell in cells:
         if _is_header_cell(cell):
-            header_rows.add(_row_index(cell))
-    return header_rows if header_rows else None
+            candidates.add(_row_index(cell))
+    if not candidates:
+        return None
+    validated = _validate_header_candidates(cells, candidates)
+    return validated if validated else None
+
+
+def _validate_header_candidates(
+    cells: list[dict], candidate_rows: set[int],
+) -> set[int]:
+    """
+    验证候选表头行是否确实是表头 (而非被 OCR 误标的数据行)。
+
+    当任何候选行通过验证后，保留所有候选行 (维持原有的多层表头结构)。
+    仅在所有候选行都被判定为「像数据」时才清空。
+    """
+    all_rows = sorted(set(_row_index(c) for c in cells))
+    data_rows = [r for r in all_rows if r not in candidate_rows]
+
+    if not data_rows:
+        return candidate_rows  # 无法验证，保留全部
+
+    validated = set()
+    rejected = set()
+    for row_idx in candidate_rows:
+        if _row_looks_like_data(cells, row_idx, data_rows):
+            rejected.add(row_idx)
+            logger.debug(
+                f"  表头验证: row={row_idx} 内容模式匹配数据行 → 从表头中移除"
+            )
+        else:
+            validated.add(row_idx)
+
+    if rejected and not validated:
+        # 全部候选行都像数据 → 清空
+        logger.debug(
+            f"  表头验证: 全部 {len(rejected)} 个候选行被判定为数据 → 返回空表头"
+        )
+        return set()
+
+    return validated  # 保留通过验证的行
+
+
+def _row_looks_like_data(
+    cells: list[dict], candidate_row_idx: int, data_row_indices: list[int],
+) -> bool:
+    """
+    判断候选行内容是否更接近数据行 (而非表头)。
+
+    多级级联检测:
+    1. 候选行有 ≥ 1/4 空 cell → 强信号 (表头极少留空)
+    2. 逐列比较候选行与数据行的内容长度模式
+       — 仅当数据行 ≥ 3 行且 ≥ 80% 列匹配时视为强信号
+    3. 候选行平均长度 ≥ 数据行平均长度 → 辅助信号
+
+    返回策略: 信号1 单独成立即可; 信号2 需数据行 ≥ 3 + 配合信号3 同时成立。
+              小样本 (< 3 数据行) 时统计不可靠，仅依赖信号1。
+    """
+    cand_cells = [c for c in cells if _row_index(c) == candidate_row_idx]
+    cand_by_col = {_col_index(c): _get_cell_text(c) for c in cand_cells}
+
+    all_cols = sorted(set(_col_index(c) for c in cand_cells))
+    non_empty = [t for t in cand_by_col.values() if t]
+
+    # 信号 1: 候选行有 ≥ 1/4 空 cell → 强信号 (表头极少留空列)
+    if len(all_cols) >= 3 and len(non_empty) / len(all_cols) < 0.75:
+        return True
+
+    # 小样本保护: 数据行不足 3 行时统计不可靠，不做信号2判断
+    if len(data_row_indices) < 3:
+        return False
+
+    # 收集数据行每列的内容
+    data_len_by_col: dict[int, list[int]] = defaultdict(list)
+    for c in cells:
+        if _row_index(c) in data_row_indices:
+            text = _get_cell_text(c)
+            data_len_by_col[_col_index(c)].append(len(text))
+
+    if not data_len_by_col:
+        return False
+
+    # 信号 2: 逐列长度模式比较 (高阈值 — ≥ 80% 列匹配)
+    matched_cols = 0
+    compared_cols = 0
+    for col in all_cols:
+        cand_text = cand_by_col.get(col, "")
+        cand_len = len(cand_text)
+        col_lens = data_len_by_col.get(col, [])
+        if not col_lens:
+            compared_cols += 1
+            continue
+        col_avg = sum(col_lens) / len(col_lens)
+        # 候选行该列与数据同列平均长度差异 < 40% → 匹配
+        if col_avg > 0 and abs(cand_len - col_avg) / max(cand_len, col_avg) < 0.4:
+            matched_cols += 1
+        compared_cols += 1
+
+    # 信号 3: 候选行平均长度 ≥ 数据行平均长度
+    cand_avg_len = sum(len(t) for t in non_empty) / max(len(non_empty), 1)
+    all_data_lens = [
+        len(_get_cell_text(c))
+        for c in cells if _row_index(c) in data_row_indices
+    ]
+    data_avg_len = sum(all_data_lens) / max(len(all_data_lens), 1)
+    longer_than_data = data_avg_len > 0 and cand_avg_len >= data_avg_len
+
+    # 信号 2 + 信号 3 同时成立 → 像数据
+    if compared_cols >= 3 and matched_cols / compared_cols >= 0.8 and longer_than_data:
+        return True
+
+    return False
 
 
 def _cells_to_html_table(cells: list[dict], row_count: int, col_count: int,
@@ -179,33 +291,249 @@ def _column_width_similarity(cols_a: dict[int, float], cols_b: dict[int, float])
     return 1.0 - sum(diffs) / len(diffs)
 
 
-def _tables_likely_same(table_a: dict, table_b: dict) -> bool:
+def _build_data_signature(table: dict, exclude_rows: set[int]) -> dict[int, dict]:
+    """
+    提取表格每列的数据行内容模式签名（排除指定行如 header）。
+
+    对每列统计:
+      - avg_len:  内容平均长度
+      - is_numeric: 该列是否为数值型 (>50% cells 可解析为数字)
+      - empty_ratio: 空 cell 比例
+
+    返回值: {col_index: {avg_len, is_numeric, empty_ratio}, ...}
+    用于比较两表的数据行是否属于同一表格。
+    """
+    cells = table.get("cells", [])
+    cols_data: dict[int, list[str]] = defaultdict(list)
+
+    for cell in cells:
+        if _row_index(cell) in exclude_rows:
+            continue
+        text = _get_cell_text(cell)
+        cols_data[_col_index(cell)].append(text)
+
+    if not cols_data:
+        return {}
+
+    signature = {}
+    for col_idx, texts in cols_data.items():
+        lengths = [len(t) for t in texts]
+        numeric_count = sum(
+            1 for t in texts
+            if t and re.match(r'^[\d,.%+\-×\s]+$', t)
+        )
+        total = len(texts)
+        signature[col_idx] = {
+            "avg_len": sum(lengths) / total if total else 0,
+            "is_numeric": (numeric_count / total) >= 0.5 if total else False,
+            "empty_ratio": sum(1 for t in texts if not t) / total if total else 0,
+        }
+    return signature
+
+
+def _data_signature_similarity(
+    sig_a: dict[int, dict], sig_b: dict[int, dict],
+) -> float:
+    """
+    比较两个数据行签名的列模式相似度。
+
+    返回 0.0 ~ 1.0 的相似度分数。
+    """
+    common = set(sig_a.keys()) & set(sig_b.keys())
+    if len(common) < 2:
+        return 0.0
+
+    scores = []
+    for col_idx in common:
+        ca, cb = sig_a[col_idx], sig_b[col_idx]
+
+        # 数值型/文本型必须一致
+        if ca["is_numeric"] != cb["is_numeric"]:
+            scores.append(0.0)
+            continue
+
+        # 长度差异分数
+        max_len = max(ca["avg_len"], cb["avg_len"])
+        if max_len > 0:
+            len_score = 1.0 - abs(ca["avg_len"] - cb["avg_len"]) / max_len
+        else:
+            len_score = 1.0  # 两列都为空
+
+        # 空值比例差异分数
+        empty_diff = abs(ca["empty_ratio"] - cb["empty_ratio"])
+        empty_score = 1.0 - empty_diff
+
+        scores.append((len_score + empty_score) / 2.0)
+
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _first_row_is_distinct_header(table: dict, prev_table: dict) -> bool:
+    """
+    判断 table 的第一行是否是一个独立的新表头（而非 prev_table 的数据延续）。
+
+    检测信号:
+    1. table 第一行有 col_span > 1 的合并单元格 → 强信号
+    2. table 第一行有 kind="columnHeader" 标注 → 强信号
+    3. table 第一行内容短 (< 25 chars average) 且 ≥2/3 列非空 → 表头形态
+    4. table 第一行与 prev_table 最后几行的列类型/长度模式比较 → 突变检测
+    5. 跨表数据列类型一致性: table 第一行 vs prev_table 数据行的类型分布
+
+    返回 True 表示 table 的第一行很可能是新表格的表头，不应合并。
+    """
+    cells = table.get("cells", [])
+    prev_cells = prev_table.get("cells", [])
+
+    if not cells:
+        return False
+
+    # 确定 table 的第一行
+    first_row_idx = min(_row_index(c) for c in cells)
+    first_row_cells = [c for c in cells if _row_index(c) == first_row_idx]
+    first_row_cells.sort(key=_col_index)
+
+    # 信号 1: 第一行有合并单元格 (col_span > 1)
+    for cell in first_row_cells:
+        if (cell.get("col_span") or 1) > 1:
+            return True
+
+    # 信号 2: 第一行有显式 columnHeader 标注
+    # (已通过 _validate_header_candidates 的 col_span/columnHeader 检查，
+    #  此处再次确认 — 与 prev_table 有相同标注且通过验证则不是新表头)
+    has_kind_header = any(c.get("kind") == "columnHeader" for c in first_row_cells)
+
+    # 信号 3: 第一行内容短且密集 (典型表头形态)
+    texts = [_get_cell_text(c) for c in first_row_cells]
+    non_empty = [t for t in texts if t]
+    avg_len = sum(len(t) for t in non_empty) / len(non_empty) if non_empty else 0
+    fill_ratio = len(non_empty) / len(texts) if texts else 0
+
+    looks_like_header = (
+        avg_len < 25
+        and fill_ratio >= 2.0 / 3.0
+        and len(non_empty) >= 2
+    )
+
+    if not looks_like_header:
+        return False
+
+    # 如果没有 prev_table → 仅凭形态判断
+    if not prev_cells:
+        return looks_like_header
+
+    prev_header_rows = _detect_header_rows(prev_cells)
+    all_prev_rows = sorted(set(_row_index(c) for c in prev_cells))
+    data_rows = [r for r in all_prev_rows if r not in prev_header_rows]
+
+    if len(data_rows) < 2:
+        return looks_like_header
+
+    # ── 信号 4: prev 最后几行 vs table 第一行的列类型比较 ──
+    # 取 prev_table 最后 3 行数据 (或全部数据行)
+    sample_rows = data_rows[-3:] if len(data_rows) >= 3 else data_rows
+    sample_cells = [c for c in prev_cells if _row_index(c) in sample_rows]
+
+    # 构建 prev 数据每列的特征: 类型 (numeric/text) + 长度范围
+    prev_col_profile: dict[int, dict] = {}
+    for col in set(_col_index(c) for c in sample_cells):
+        col_texts = [
+            _get_cell_text(c)
+            for c in sample_cells if _col_index(c) == col
+        ]
+        if not col_texts:
+            continue
+        lengths = [len(t) for t in col_texts]
+        numeric_count = sum(
+            1 for t in col_texts
+            if t and re.match(r'^[\d,.%+\-×\s]+$', t)
+        )
+        prev_col_profile[col] = {
+            "min_len": min(lengths),
+            "max_len": max(lengths),
+            "is_numeric": numeric_count / len(col_texts) >= 0.5,
+        }
+
+    # 比较 table 第一行每列 vs prev 数据列模式
+    type_matched = 0
+    type_mismatched = 0
+    len_in_range = 0
+    total_compared = 0
+
+    for cell in first_row_cells:
+        col = _col_index(cell)
+        profile = prev_col_profile.get(col)
+        if profile is None:
+            continue
+        total_compared += 1
+        text = _get_cell_text(cell)
+        cur_len = len(text)
+
+        # 类型比较: numeric vs text
+        cur_is_numeric = bool(text and re.match(r'^[\d,.%+\-×\s]+$', text))
+        if cur_is_numeric == profile["is_numeric"]:
+            type_matched += 1
+        else:
+            type_mismatched += 1
+
+        # 长度范围比较
+        if profile["min_len"] <= cur_len <= profile["max_len"] * 1.5:
+            len_in_range += 1
+
+    if total_compared < 2:
+        # 可比较的列太少，如果有 kind 标注则信任它是同一表格的延续
+        if has_kind_header:
+            return False  # prev 也有同标注，信任为同一表格
+        return looks_like_header
+
+    # 类型匹配率 > 80% → 数据延续
+    type_match_ratio = type_matched / total_compared
+    if type_match_ratio > 0.8:
+        return False  # 列类型高度一致 → 同一表格的数据延续
+
+    # 类型不匹配 ≥1 且长度不在范围内 ≥ 一半列 → 新表头
+    if type_mismatched >= 1 and len_in_range / total_compared < 0.5:
+        return True
+
+    return False
+
+
+def _tables_likely_same(
+    table_a: dict, table_b: dict,
+    first_table: Optional[dict] = None,
+) -> bool:
     """
     判断两个表格是否可能是同一表格的延续。
 
-    支持三种场景:
-    1. 两表都有表头标注 → 比较表头签名
-    2. 仅一表有表头标注 (续页无表头) → 仅比较列结构
-    3. 两表都无表头标注 → 仅比较列结构
+    判断链:
+    1. 列数相同 (硬条件)
+    2. 列宽比例相似 (硬条件, ≥ 0.7)
+    3. 双方都有显式表头 → 比较表头签名 + 数据连续性交叉检查
+    4. 一方或双方无显式表头 → 数据连续性检查:
+       a) table_b 第一行是否为独立新表头 → False
+       b) 两表数据行签名比较 → 不相似 → False
+    5. 全局基线检查: 将 table_b 与集团首页 (first_table) 做数据模式比对
     """
+    cells_a = table_a.get("cells", [])
+    cells_b = table_b.get("cells", [])
+
     # 条件1: 列数相同
     if table_a.get("col_count", 0) != table_b.get("col_count", 0):
         return False
 
     # 条件2: 列宽比例相似
-    cols_a = _calc_column_widths(table_a.get("cells", []))
-    cols_b = _calc_column_widths(table_b.get("cells", []))
+    cols_a = _calc_column_widths(cells_a)
+    cols_b = _calc_column_widths(cells_b)
     if _column_width_similarity(cols_a, cols_b) < 0.7:
         return False
 
-    # 条件3: 表头比较 (仅当双方都有显式表头标注时)
-    h_rows_a = _detect_header_rows(table_a.get("cells", []))
-    h_rows_b = _detect_header_rows(table_b.get("cells", []))
+    # 条件3: 表头比较
+    h_rows_a = _detect_header_rows(cells_a)
+    h_rows_b = _detect_header_rows(cells_b)
 
     if h_rows_a and h_rows_b:
         # 两表都有表头 → 比较签名
-        sig_a = _build_header_signature(table_a.get("cells", []), h_rows_a)
-        sig_b = _build_header_signature(table_b.get("cells", []), h_rows_b)
+        sig_a = _build_header_signature(cells_a, h_rows_a)
+        sig_b = _build_header_signature(cells_b, h_rows_b)
         if sig_a and sig_b:
             words_a = set(sig_a.split())
             words_b = set(sig_b.split())
@@ -213,21 +541,117 @@ def _tables_likely_same(table_a: dict, table_b: dict) -> bool:
                 jaccard = len(words_a & words_b) / len(words_a | words_b)
                 if jaccard < HEADER_SIMILARITY_THRESHOLD:
                     return False
-    # else: 一方或双方无显式表头 → 跳过签名比较, 仅靠列结构匹配
-    # 典型场景: Page1 有表头, Page2-5 纯数据行无表头标注
+                # Jaccard 通过 → 继续数据连续性检查 (不直接 return)
+                # 防止: 两表表头文本相似但 table_b 实际是另一个表的开头
+
+        # 数据连续性交叉检查: table_b 第一行是否为数据延续
+        # 如果 table_b 第一行看起来像新表头 (不同于 table_a 数据模式) → 不同表格
+        if _first_row_is_distinct_header(table_b, table_a):
+            logger.debug(
+                f"  表格合并跳过: 双方有表头但 table_b 第一行为独立新表头 "
+                f"(pages={table_a.get('page_numbers')} vs {table_b.get('page_numbers')})"
+            )
+            return False
+
+        # 全局基线检查 (如果有)
+        if first_table is not None and first_table is not table_a:
+            sig_first = _build_header_signature(
+                first_table.get("cells", []),
+                _detect_header_rows(first_table.get("cells", [])),
+            )
+            if sig_first and sig_b:
+                words_first = set(sig_first.split())
+                if words_first and words_b:
+                    jaccard_first = len(words_first & words_b) / len(words_first | words_b)
+                    if jaccard_first < HEADER_SIMILARITY_THRESHOLD:
+                        logger.debug(
+                            f"  表格合并跳过: table_b 表头与集团首页表头不匹配 "
+                            f"(jaccard={jaccard_first:.2f} < {HEADER_SIMILARITY_THRESHOLD})"
+                        )
+                        return False
+
+        return True
+
+    # 条件4: 一方或双方无显式表头 → 数据连续性检查
+
+    # 4a: 边界检测 — table_b 有表头但 table_a 没有
+    # 这很可能是新表格的开端, 需要与集团首页表头做交叉比对
+    if h_rows_b and not h_rows_a:
+        if first_table is not None:
+            h_first = _detect_header_rows(first_table.get("cells", []))
+            if h_first:
+                # table_b 的表头 vs 集团首页的表头
+                sig_b_hdr = _build_header_signature(cells_b, h_rows_b)
+                sig_first_hdr = _build_header_signature(
+                    first_table.get("cells", []), h_first,
+                )
+                if sig_b_hdr and sig_first_hdr:
+                    words_b = set(sig_b_hdr.split())
+                    words_first = set(sig_first_hdr.split())
+                    if words_b and words_first:
+                        jaccard = len(words_b & words_first) / len(words_b | words_first)
+                        if jaccard < HEADER_SIMILARITY_THRESHOLD:
+                            logger.debug(
+                                f"  表格合并跳过: table_b 表头与首页表头不匹配 (边界检测) "
+                                f"(jaccard={jaccard:.2f} < {HEADER_SIMILARITY_THRESHOLD})"
+                            )
+                            return False
+            else:
+                # 集团首页也无表头, table_b 突然出现表头 → 可能是新表
+                if _first_row_is_distinct_header(table_b, table_a):
+                    return False
+                # 否则继续, 让数据签名来判断
+
+    # 4b: table_b 的第一行是否是新表头
+    if _first_row_is_distinct_header(table_b, table_a):
+        logger.debug(
+            f"  表格合并跳过: table_b 第一行为独立新表头 "
+            f"(pages={table_a.get('page_numbers')} vs {table_b.get('page_numbers')})"
+        )
+        return False
+
+    # 4c: 比较两表数据行内容模式
+    sig_a = _build_data_signature(table_a, h_rows_a)
+    sig_b = _build_data_signature(table_b, h_rows_b)
+
+    if sig_a and sig_b:
+        similarity = _data_signature_similarity(sig_a, sig_b)
+        if similarity < DATA_SIMILARITY_THRESHOLD:
+            logger.debug(
+                f"  表格合并跳过: 数据内容模式不相似 "
+                f"(similarity={similarity:.2f} < {DATA_SIMILARITY_THRESHOLD})"
+            )
+            return False
+
+    # 4d: 全局基线检查 — table_b vs 集团首页
+    # 对任意一方无显式表头的情况都做 (含 P10无表头→P11有新表头 已通过边界检测的场景)
+    if first_table is not None and first_table is not table_a:
+        h_first = _detect_header_rows(first_table.get("cells", []))
+        sig_first = _build_data_signature(first_table, h_first)
+        if sig_first and sig_b:
+            similarity_to_first = _data_signature_similarity(sig_first, sig_b)
+            if similarity_to_first < DATA_SIMILARITY_THRESHOLD:
+                logger.debug(
+                    f"  表格合并跳过: table_b 数据模式与集团首页不匹配 "
+                    f"(similarity={similarity_to_first:.2f} < {DATA_SIMILARITY_THRESHOLD})"
+                )
+                return False
 
     return True
 
 
-def _is_continuation_table(table: dict, prev_table: dict) -> bool:
+def _is_continuation_table(
+    table: dict, prev_table: dict, first_table: Optional[dict] = None,
+) -> bool:
     """
     判断 table 是否是 prev_table 在同一文档中的延续。
 
     条件:
-    1. table 在页面顶部 (y 坐标小)
-    2. prev_table 在上一页底部
-    3. 列数相同
-    4. 表头相似
+    1. 在不同页面
+    2. 页面连续 (prev 最大页 + 1 == table 最小页)
+    3. 列数 + 列宽 + 表头/数据模式符合 (见 _tables_likely_same)
+
+    first_table 为集团首页表格，用于全局基线比对 (可选)。
     """
     cells = table.get("cells", [])
     prev_cells = prev_table.get("cells", [])
@@ -251,7 +675,7 @@ def _is_continuation_table(table: dict, prev_table: dict) -> bool:
             # 不连续 → 不是同一表格
             return False
 
-    return _tables_likely_same(table, prev_table)
+    return _tables_likely_same(table, prev_table, first_table=first_table)
 
 
 def merge_cross_page_tables(all_tables: list[dict]) -> list[dict]:
@@ -259,16 +683,9 @@ def merge_cross_page_tables(all_tables: list[dict]) -> list[dict]:
     跨页表格合并入口。
 
     流程:
-    1. 按页码排序所有表格
-    2. 检测跨页延续关系
-    3. 从续页表格中移除重复的表头行
-    4. 合并为单个逻辑表格
-
-    Args:
-        all_tables: 所有页面的表格列表 (来自 Azure DI 的标准化 table dict)
-
-    Returns:
-        合并后的表格列表 (跨页表格已合并, 单页表格保持原样)
+    1. 使用 _detect_continuation_groups 检测跨页延续关系 (含全局基线)
+    2. 对每组延续表格调用 _merge_table_group 合并
+    3. 单页表格直接保留
     """
     if len(all_tables) <= 1:
         return all_tables
@@ -276,35 +693,21 @@ def merge_cross_page_tables(all_tables: list[dict]) -> list[dict]:
     # 按第一页排序
     tables = sorted(all_tables, key=lambda t: min(t.get("page_numbers", [999])))
 
+    # 使用统一的分组检测逻辑 (含全局基线比较)
+    groups = _detect_continuation_groups(tables)
+
     merged = []
-    i = 0
-    while i < len(tables):
-        current = tables[i]
-
-        # 检查后续表格是否为当前表格的延续
-        continuation_group = [current]
-        j = i + 1
-        while j < len(tables):
-            if _is_continuation_table(tables[j], continuation_group[-1]):
-                continuation_group.append(tables[j])
-                j += 1
-            else:
-                break
-
-        if len(continuation_group) == 1:
-            # 单页表格, 直接保留
-            merged.append(current)
+    for group in groups:
+        if len(group) == 1:
+            merged.append(group[0])
         else:
-            # 跨页表格, 合并
-            merged_table = _merge_table_group(continuation_group)
+            merged_table = _merge_table_group(group)
             merged.append(merged_table)
             logger.info(
-                f"跨页表格合并: {len(continuation_group)} 个分片 → "
+                f"跨页表格合并: {len(group)} 个分片 → "
                 f"1 个表格 ({merged_table['row_count']} 行 × {merged_table['col_count']} 列), "
                 f"页码范围: {merged_table['page_numbers']}"
             )
-
-        i = j
 
     return merged
 
@@ -421,6 +824,21 @@ def _merge_table_group(table_group: list[dict]) -> dict:
     all_rows = set(_row_index(c) for c in all_cells)
     new_row_count = max(all_rows) + 1 if all_rows else 0
 
+    # ★ 安全裁剪: 跨页 rowspan 不超出合并后总行数
+    # OCR 按页独立标注 rowspan, 合并后需确保 rowspan ≤ 剩余行数
+    rowspan_clipped = 0
+    for cell in all_cells:
+        rs = cell.get("row_span", 1)
+        r = _row_index(cell)
+        max_possible = new_row_count - r
+        if rs > max_possible:
+            cell["row_span"] = max_possible
+            rowspan_clipped += 1
+    if rowspan_clipped > 0:
+        logger.debug(
+            f"  合并表格: {rowspan_clipped} 个 cell 的 rowspan 被裁剪至边界"
+        )
+
     # 生成合并后的 HTML
     merged_html = _cells_to_html_table(
         all_cells,
@@ -446,21 +864,16 @@ def _merge_table_group(table_group: list[dict]) -> dict:
 
 def _extract_header_cells(table: dict) -> list[dict]:
     """
-    提取表格中的表头 cells (基于 Azure DI kind 标注)。
+    提取表格中的表头 cells (通过 _detect_header_rows 验证)。
 
-    如果无标注, 取所有 cells 中 row_index == 0 的行作为表头。
+    仅返回通过 _validate_header_candidates 过滤后的表头行 cells。
+    无显式标注或全被过滤 → 返回空列表。
     """
     cells = table.get("cells", [])
-    # 优先使用 kind 标注
-    header_cells = [c for c in cells if c.get("kind") == "columnHeader"]
-    if header_cells:
-        return header_cells
-
-    # 回退: 第一行
-    first_row = min((_row_index(c) for c in cells), default=-1)
-    if first_row >= 0:
-        header_cells = [c for c in cells if _row_index(c) == first_row]
-    return header_cells
+    validated_rows = _detect_header_rows(cells)  # 内部已调用 _validate_header_candidates
+    if not validated_rows:
+        return []
+    return [c for c in cells if _row_index(c) in validated_rows]
 
 
 def _prepend_header_to_table(table: dict, header_cells: list[dict]) -> dict:
@@ -514,14 +927,7 @@ def complete_table_headers(pages_data: list[dict]) -> list[dict]:
     """
     跨页表格表头补全 — 保持按页存储, 为缺失表头的续页补全表头。
 
-    与 apply_cross_page_table_merge 的区别:
-    - merge 模式: 所有分片合并为一个逻辑表格, 放入首页
-    - complete 模式: 表格分页保留在各自页面, 仅为续页补全表头
-
-    处理逻辑:
-    1. 检测跨页表格延续组 (与 merge 相同)
-    2. 从首页提取表头 cells
-    3. 对续页: 如果没有显式表头 → 从首页复制表头插入
+    支持父子嵌套表格: 按页内 Y 位置将表格分链独立处理。
 
     Args:
         pages_data: 页面数据列表
@@ -529,32 +935,23 @@ def complete_table_headers(pages_data: list[dict]) -> list[dict]:
     Returns:
         修改后的 pages_data
     """
-    # 收集所有表格 (保留页码信息)
-    all_tables_with_page = []
-    for page in pages_data:
-        page_num = page["page_number"]
-        for table in page.get("tables", []):
-            all_tables_with_page.append((page_num, table))
+    # 按 Y 位置构建位置锚定链
+    chains = _build_position_anchored_chains(pages_data)
 
-    if len(all_tables_with_page) <= 1:
+    if not chains:
         return pages_data
-
-    tables_only = [t for _, t in all_tables_with_page]
-
-    # 检测延续组
-    continuation_groups = _detect_continuation_groups(tables_only)
 
     total_completed = 0
     total_found = 0
 
-    for group in continuation_groups:
-        if len(group) <= 1:
+    for chain in chains:
+        if len(chain) <= 1:
             continue
 
         total_found += 1
 
         # 首页表格 → 提取表头
-        first_table = group[0]
+        first_table = chain[0]
         header_cells = _extract_header_cells(first_table)
 
         if not header_cells:
@@ -562,23 +959,21 @@ def complete_table_headers(pages_data: list[dict]) -> list[dict]:
             continue
 
         # 对每个续页表格: 检查是否缺表头, 缺则补全
-        for cont_table in group[1:]:
+        for cont_table in chain[1:]:
             cont_headers = _detect_header_rows(cont_table.get("cells", []))
 
             if not cont_headers:
-                # ★ 续页表头缺失 → 补全
                 logger.info(
                     f"  表头补全: 续页表格 (pages={cont_table.get('page_numbers')}) "
                     f"无表头 → 从首页复制 {len(header_cells)} cells"
                 )
 
-                # 更新续页表格 (原地修改)
                 updated = _prepend_header_to_table(cont_table, header_cells)
 
-                # 将修改写回 pages_data
+                # 写回 pages_data
                 for page_data in pages_data:
                     for i, t in enumerate(page_data.get("tables", [])):
-                        if t is cont_table:  # 直接引用比较
+                        if t is cont_table:
                             page_data["tables"][i] = updated
                             break
 
@@ -591,7 +986,8 @@ def complete_table_headers(pages_data: list[dict]) -> list[dict]:
 
     if total_found > 0:
         logger.info(
-            f"跨页表格处理: {total_found} 组, "
+            f"跨页表格处理: {len(chains)} 条位置链, "
+            f"{total_found} 组跨页, "
             f"{total_completed} 个续页表头补全"
         )
 
@@ -599,7 +995,13 @@ def complete_table_headers(pages_data: list[dict]) -> list[dict]:
 
 
 def _detect_continuation_groups(tables: list[dict]) -> list[list[dict]]:
-    """检测跨页表格延续组 (返回分组, 每组是一系列延续的表格)"""
+    """
+    检测跨页表格延续组。
+
+    每个候选表格需同时通过两项检查:
+    1. 与前一个表格的 _is_continuation_table (相邻比较)
+    2. 与集团首页表格的全局基线比较 (防止数据漂移)
+    """
     if len(tables) <= 1:
         return [tables] if tables else []
 
@@ -610,14 +1012,200 @@ def _detect_continuation_groups(tables: list[dict]) -> list[list[dict]]:
     current_group = [sorted_tables[0]]
 
     for i in range(1, len(sorted_tables)):
-        if _is_continuation_table(sorted_tables[i], current_group[-1]):
-            current_group.append(sorted_tables[i])
-        else:
+        candidate = sorted_tables[i]
+        prev_table = current_group[-1]
+        first_table = current_group[0]
+
+        # 相邻比较 (传递集团首页做边界检测)
+        if not _is_continuation_table(candidate, prev_table,
+                                       first_table=first_table):
             groups.append(current_group)
-            current_group = [sorted_tables[i]]
+            current_group = [candidate]
+            continue
+
+        # 全局基线比较 (集团长度 > 1 时才启用)
+        if len(current_group) >= 2:
+            if not _is_continuation_of_group(candidate, current_group):
+                groups.append(current_group)
+                current_group = [candidate]
+                continue
+
+        current_group.append(candidate)
 
     groups.append(current_group)
     return groups
+
+
+def _is_continuation_of_group(
+    table: dict, group: list[dict],
+) -> bool:
+    """
+    检查 table 是否为 group 的延续 (全局基线比较)。
+
+    将 table 与 group 首页做比对，防止局部相似但全局漂移。
+    长表格使用自适应阈值，容忍自然数据波动。
+
+    条件:
+    1. 与 group 首页的列宽比例 ≥ 0.7
+    2. 与 group 首页的数据行签名相似度 ≥ 自适应阈值
+    """
+    if not group:
+        return True
+
+    first = group[0]
+    cells = table.get("cells", [])
+    first_cells = first.get("cells", [])
+
+    # 列数检查
+    if table.get("col_count", 0) != first.get("col_count", 0):
+        return False
+
+    # 列宽比例比较 (硬条件, 不降阈)
+    cols = _calc_column_widths(cells)
+    cols_first = _calc_column_widths(first_cells)
+    if _column_width_similarity(cols, cols_first) < 0.7:
+        logger.debug(
+            f"  全局基线跳过: 列宽比例 vs 首页不匹配 "
+            f"(pages={table.get('page_numbers')} vs group首页 {first.get('page_numbers')})"
+        )
+        return False
+
+    # 数据行签名比较 — 长表格自适应阈值
+    h_rows = _detect_header_rows(cells)
+    h_first = _detect_header_rows(first_cells)
+
+    sig = _build_data_signature(table, h_rows)
+    sig_first = _build_data_signature(first, h_first)
+
+    if sig and sig_first:
+        similarity = _data_signature_similarity(sig, sig_first)
+
+        # 自适应阈值: 长表格容忍更大漂移
+        #   ≤5 页 → 0.50 (严格, 确保同一表格)
+        #   5-15 页 → 线性降到 0.30
+        #   >15 页 → 0.30 (仅防止类型级突变)
+        group_len = len(group)
+        if group_len <= 5:
+            threshold = 0.50
+        elif group_len <= 15:
+            threshold = 0.50 - (group_len - 5) * 0.02  # 5→0.50, 15→0.30
+        else:
+            threshold = 0.30
+
+        if similarity < threshold:
+            logger.debug(
+                f"  全局基线跳过: 数据模式与首页不匹配 "
+                f"(similarity={similarity:.2f} < threshold={threshold:.2f}, "
+                f"group_len={group_len}, "
+                f"candidate pages={table.get('page_numbers')})"
+            )
+            return False
+
+    return True
+
+
+# ── 页内位置锚定: 父子嵌套表格 ────────────────────────────
+
+def _get_table_y_position(table: dict) -> float:
+    """获取表格在页面上的垂直起始位置 (取所有 cell bbox 的最小 Y)"""
+    cells = table.get("cells", [])
+    if not cells:
+        return 0.0
+    min_y = float('inf')
+    for cell in cells:
+        bbox = cell.get("bbox")
+        if bbox and len(bbox) == 4 and bbox[1] > 0:
+            min_y = min(min_y, float(bbox[1]))
+    return min_y if min_y != float('inf') else 0.0
+
+
+def _build_position_anchored_chains(
+    pages_data: list[dict],
+) -> list[list[dict]]:
+    """
+    按页内 Y 位置将表格分组为独立跨页链，支持父子嵌套表格。
+
+    算法: 对每页按 Y 排序后的表格，与前一页做 Y 邻近 + 内容匹配。
+    - 同一 Y 位置 + 通过 _tables_likely_same → 同一链 (跨页延续)
+    - 无匹配 → 新链 (新表格开始)
+    - 前一页有链但当前页无匹配 → 该链结束
+
+    返回:
+        chains: 每条链是一个列表 [P1-table, P2-table, ...]
+                链内表格来自连续页面、相同 Y 位置锚定
+
+    示例:
+        P1: [父表 y=100, 子表 y=500]
+        P2: [父表续 y=100, 子表续 y=500]
+        → chain-0: [P1-父, P2-父续], chain-1: [P1-子, P2-子续]
+    """
+    # 收集所有表格带页面号
+    tables_by_page: dict[int, list[dict]] = defaultdict(list)
+    for page in pages_data:
+        pn = page["page_number"]
+        page_tables = sorted(page.get("tables", []), key=_get_table_y_position)
+        if page_tables:
+            tables_by_page[pn] = page_tables
+
+    if not tables_by_page:
+        return []
+
+    sorted_pages = sorted(tables_by_page.keys())
+    chains: list[list[dict]] = []      # 所有链
+    prev_assignments: list[tuple[int, dict]] = []  # [(chain_idx, prev_table), ...]
+
+    for page_num in sorted_pages:
+        curr_tables = tables_by_page[page_num]
+
+        if not prev_assignments:
+            # 第一页: 每个表格各起一条链
+            for table in curr_tables:
+                chains.append([table])
+                prev_assignments.append((len(chains) - 1, table))
+            continue
+
+        # 为每个当前表格找最佳的前页匹配
+        used_prev: set[int] = set()
+        curr_assignments: list[tuple[int, dict]] = []
+
+        for curr_table in curr_tables:
+            best_pi: Optional[int] = None
+            best_score = 0.0
+
+            for pi, (chain_idx, prev_table) in enumerate(prev_assignments):
+                if pi in used_prev:
+                    continue
+                # 内容匹配第一
+                first_of_chain = chains[chain_idx][0]
+                if not _tables_likely_same(
+                    curr_table, prev_table, first_table=first_of_chain,
+                ):
+                    continue
+
+                # Y 邻近度打分 (越近越高)
+                y_diff = abs(
+                    _get_table_y_position(curr_table)
+                    - _get_table_y_position(prev_table)
+                )
+                score = 1.0 / (1.0 + y_diff)
+
+                if score > best_score:
+                    best_score = score
+                    best_pi = pi
+
+            if best_pi is not None:
+                chain_idx = prev_assignments[best_pi][0]
+                chains[chain_idx].append(curr_table)
+                used_prev.add(best_pi)
+                curr_assignments.append((chain_idx, curr_table))
+            else:
+                # 无匹配 → 新链
+                chains.append([curr_table])
+                curr_assignments.append((len(chains) - 1, curr_table))
+
+        prev_assignments = curr_assignments
+
+    return chains
 
 
 # ── 便捷入口: 对整个文档的表格进行跨页合并 ──────────────
@@ -626,7 +1214,8 @@ def apply_cross_page_table_merge(pages_data: list[dict]) -> list[dict]:
     """
     对 RAG Pipeline 的 pages_data 进行跨页表格合并。
 
-    直接修改每个页面的 tables 列表, 替换为合并后的表格。
+    支持父子嵌套表格: 按页内 Y 位置将表格分链，
+    每条链独立做跨页合并，父子表格互不干扰。
 
     Args:
         pages_data: _group_azure_results_by_page 的输出
@@ -634,37 +1223,41 @@ def apply_cross_page_table_merge(pages_data: list[dict]) -> list[dict]:
     Returns:
         修改后的 pages_data (就地修改)
     """
-    # 收集所有表格
-    all_tables = []
-    for page in pages_data:
-        all_tables.extend(page.get("tables", []))
+    # 按 Y 位置构建位置锚定链 (父子表格分离)
+    chains = _build_position_anchored_chains(pages_data)
 
-    if not all_tables:
+    if not chains:
         return pages_data
 
-    # 合并
-    merged_tables = merge_cross_page_tables(all_tables)
+    total_original = sum(len(chain) for chain in chains)
 
-    if len(merged_tables) == len(all_tables):
+    # 每条链独立合并
+    all_merged = []
+    for chain in chains:
+        if len(chain) <= 1:
+            all_merged.extend(chain)
+        else:
+            merged_parts = merge_cross_page_tables(chain)
+            all_merged.extend(merged_parts)
+
+    if len(all_merged) == total_original:
         logger.debug("跨页表格检测: 无跨页表格")
         return pages_data
 
     logger.info(
-        f"跨页表格合并: {len(all_tables)} 个原始表格 → "
-        f"{len(merged_tables)} 个逻辑表格 ",
+        f"跨页表格合并: {total_original} 个原始表格 "
+        f"({len(chains)} 条位置链) → "
+        f"{len(all_merged)} 个逻辑表格"
     )
 
-    # 重建页面表格分配: 将合并后的表格放入首页所在页面
+    # 重建页面表格分配
     table_by_first_page: dict[int, list[dict]] = defaultdict(list)
-    for table in merged_tables:
+    for table in all_merged:
         first_page = min(table.get("page_numbers", [0]))
         table_by_first_page[first_page].append(table)
 
     for page in pages_data:
         page_num = page["page_number"]
-        if page_num in table_by_first_page:
-            page["tables"] = table_by_first_page[page_num]
-        else:
-            page["tables"] = []
+        page["tables"] = table_by_first_page.get(page_num, [])
 
     return pages_data
